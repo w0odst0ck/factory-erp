@@ -192,3 +192,121 @@ docker compose -f pwd.yml down
   - **要** → 跑方案 A 或 B
   - **不要** → 跑方案 C 停掉（省资源、去噪音）
 - [ ] 是否需要我把"容器重启次数巡检"写进监控 SOP
+
+
+---
+
+# ✅ 执行记录：方案 B（2026-10-13 21:31 用户拍板）
+
+## 一、执行过程
+
+```bash
+cd /home/l/.openclaw/workspace/projects/factory-erp/local-ops/frappe_docker
+docker compose -f pwd.yml down          # 不带 -v，保留数据卷
+docker compose -f pwd.yml up -d
+```
+
+**执行前确认**：四个数据卷存在（`frappe_docker_db-data` / `logs` / `redis-queue-data` / `sites`）
+**执行后**：9 个容器全部 Up，**重启循环停止**（`restarts=0`）
+
+## 二、⚠️ 但排查中发现两层更深的问题（都已修复）
+
+方案 B 解决了"重启循环"，但**站点仍不可用**。逐层排查后发现问题不止一层。
+
+### 第 1 层｜容器间网络断裂（backend 被网络隔离）
+
+**现象**：站点请求挂住 80 秒无响应（不是 4xx/5xx，是超时）。
+
+**定位过程**（每一步都是一次决定性对照）：
+
+| 测试 | 结果 | 说明 |
+|---|---|---|
+| 宿主 → backend:8000 | ✅ 404（0.0027s） | 应用本身正常 |
+| 宿主 → db:3306 | ✅ OK | 宿主到容器正常 |
+| **backend → db:3306** | ❌ Timeout | **容器出网失败** |
+| **backend → redis-queue:6379** | ❌ Timeout | 同上 |
+| **backend 自连 172.18.0.7:8000** | ✅ OK | 自己连自己正常 |
+| **backend → 外网 1.1.1.1:443** | ❌ Timeout | 完全出不去 |
+| **scheduler → db / redis** | ✅ **全部 OK** | **同网同镜像却正常** |
+| **queue-long → redis-queue** | ✅ OK | 同上 |
+| 探针容器 → db / redis-queue | ✅ OK | 新容器同网正常 |
+| **探针容器 → backend:8000** | ❌ Timeout | 别人进不来 |
+
+**结论：只有 backend 一个容器被隔离，双向不通**，而同网同镜像的 scheduler / queue-long 完全正常。
+
+**试过但无效**：
+- `--force-recreate backend`（容器重建）→ 无效
+- `network disconnect` + `network connect`（端点重建）→ 无效
+
+**最终解法：重建整个网络**
+
+```bash
+docker compose -f pwd.yml down          # 会一并删掉网络
+docker compose -f pwd.yml up -d         # 重新创建网络
+```
+
+✅ **生效**：backend 恢复 → `db OK` / `redis-queue OK` / `websocket OK`
+
+> 📌 **教训**：容器网络端点损坏时，**`--force-recreate` 和端点重建都不够，必须重建网络本身**。
+
+### 第 2 层｜数据库授权绑定旧 IP（暴露出的下一层）
+
+网络修好后，站点从"挂 80 秒"变成 **500（0.029s）** —— 说明能打到后端了，暴露下一层问题：
+
+```
+MySQLdb.OperationalError: (1045, "Access denied for user 'erpnext'@'172.18.0.6' (using password: YES)")
+```
+
+**根因**：`erpnext` 数据库用户**只授权给 `172.18.0.9`**（历史遗留的旧容器 IP）：
+
+```
+GRANT ALL PRIVILEGES ON `erpnext`.* TO `erpnext`@`172.18.0.9`
+```
+
+网络重建后 backend 的 IP 变成 `172.18.0.6` → **IP 不匹配 → 认证被拒**。
+
+> ⚠️ 这是**预先存在**的问题，只是之前网络不通、根本没走到认证这一步，所以没暴露。
+
+**修复（追加式，不动原授权）**：
+
+```sql
+-- 用 site_config.json 里已有的密码，追加一条通配授权
+CREATE USER IF NOT EXISTS 'erpnext'@'%' IDENTIFIED BY '<site_config 里的密码>';
+GRANT ALL PRIVILEGES ON `erpnext`.* TO 'erpnext'@'%';
+FLUSH PRIVILEGES;
+```
+
+**为什么用 `%` 而不是只补新 IP**：容器 IP 每次重建都会变，绑定单个 IP 会**反复踩同一个坑**。
+
+**数据完好**：`erpnext` 库 **742 张表**，未受影响。
+
+## 三、最终验证（全部通过）
+
+| 项 | 结果 |
+|---|---|
+| 站点 `http://127.0.0.1:8082/`（Host: factory.local） | ✅ **200**（0.14s → 0.022s） |
+| 9 个容器 | ✅ 全部 Up |
+| 重启计数 | ✅ `frontend=0` / `websocket=0` / `backend=0` / `queue-long=1`（仅初始一次） |
+| backend 出网 | ✅ db / redis-queue / websocket 全通 |
+
+**访问方式**（注意要带 Host 头，nginx 按 `server_name` 路由）：
+
+```bash
+curl -H "Host: factory.local" http://127.0.0.1:8082/
+# 浏览器访问需 hosts 加：127.0.0.1  factory.local
+```
+
+## 四、本次修复清单（可回溯）
+
+| # | 动作 | 性质 | 影响面 |
+|:--:|---|---|---|
+| 1 | `compose down` + `up -d`（方案 B） | 重启整栈 | 修复重启循环 |
+| 2 | **重建 docker 网络** | 删网络重建 | 修复 backend 网络隔离 |
+| 3 | **追加 `erpnext@'%'` 数据库授权** | **数据层变更** ⚠️ | 修复 DB 认证；不动原授权 |
+| 4 | 数据卷 | **未动** | `db-data`/`sites`/`logs`/`redis-queue-data` 全保留 |
+
+## 五、遗留建议
+
+- [ ] **`erpnext` 用户绑定 IP 是隐患** —— 若将来再重建网络，`@'%'` 已覆盖，不会再踩；但建议同类项目统一用 `@'%'` + 强密码
+- [ ] **compose working_dir label 仍指向失效路径** —— 不影响运行，但建议在正确目录重跑一次 `up -d` 以更新 label
+- [ ] **容器命名带项目名前缀**（`frappe_docker-*`）而非 compose 标准（`frappe_docker-backend-1`）—— 说明是旧版 compose 创建的，重建后已规范化
