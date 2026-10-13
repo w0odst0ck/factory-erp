@@ -27,36 +27,59 @@
 
 ## 二、根因
 
-### 直接原因：连不上 redis-queue
+### ⚠️ 三个容器失败原因**不同**（别一概而论）
 
-**websocket 日志**：
+逐个核实后的真实错误：
+
+| 容器 | 失败的直接原因 | 缺失的依赖 |
+|---|---|---|
+| **websocket** | `Error: getaddrinfo ENOTFOUND redis-queue` | `redis-queue` |
+| **queue-long** | `redis.exceptions.ConnectionError: Error -2 connecting to redis-queue:6379. Name or service not known.` | `redis-queue` |
+| **frontend** | `[emerg] host not found in upstream "backend:8000" in /etc/nginx/conf.d/frappe.conf` | **`backend`（不是 redis）** |
+
+**原始日志**：
+
 ```
+# websocket（node）
 Error: getaddrinfo ENOTFOUND redis-queue
-    at RedisSocket.connect ... (/home/frappe/frappe-bench/apps/frappe/realtime/index.js:76)
+    at RedisSocket.connect ... (realtime/index.js:76)
   errno: -3008, code: 'ENOTFOUND', hostname: 'redis-queue'
-```
 
-**queue-long 日志**：
-```
+# queue-long（python）
 redis.exceptions.ConnectionError: Error -2 connecting to redis-queue:6379.
 Name or service not known.
+
+# frontend（nginx）
+[emerg] 12#12: host not found in upstream "backend:8000" in /etc/nginx/conf.d/frappe.conf:2
 ```
 
-### 上游原因：依赖容器已退出，DNS 名解析不到
+> 📌 **修正说明**：本节初版把三个容器都归因为"连不上 redis"，**不准确**。
+> frontend 是 nginx，它的上游是 `backend:8000` —— 失败原因是 **backend 容器不在**，与 redis 无关。
+
+### 上游原因：依赖容器全部已退出，DNS 名解析不到
 
 ```
-frappe_docker-db-1           exited  (started 2026-09-16)
-frappe_docker-redis-cache-1  exited  (started 2026-09-15)
-frappe_docker-redis-queue-1  exited  (started 2026-09-11)
+frappe_docker-db-1           exited (exit 0)  started 2026-09-16
+frappe_docker-redis-cache-1  exited (exit 0)  started 2026-09-15
+frappe_docker-redis-queue-1  exited (exit 0)  started 2026-09-11
+frappe_docker-backend-1      exited (exit 0)  started 2026-09-15   ← frontend 依赖它
 ```
 
-**docker 里每个容器的服务名就是 DNS 名**。`redis-queue` / `redis-cache` 容器已退出，Docker 内嵌 DNS 就不再有这个条目 →
+**统一机制**：Docker 里**每个容器的服务名就是 DNS 名**。容器一退出，内嵌 DNS 里就没有这个条目 →
 
-- websocket / queue-long / frontend 连不上 redis → 启动失败（exit 1）
+- 依赖它的容器启动时解析失败 → **exit 1**
 - 退出码 1 + `restart: on-failure` → **无限重启循环**
 
-> 关键对照：`scheduler-1` 是唯一还活着的 frappe 容器（它不依赖 redis 也能起），
-> 恰好反证了"不是镜像坏了，是**依赖没了**"。
+```
+依赖链断裂图
+  frontend  ──需要──> backend:8000     ❌ 已退出 → nginx [emerg] host not found
+  websocket ──需要──> redis-queue:6379  ❌ 已退出 → ENOTFOUND
+  queue-long──需要──> redis-queue:6379  ❌ 已退出 → ConnectionError
+  scheduler ──需要──> ?                 ✅ 还活着（restarts=0）
+```
+
+> 关键对照：`scheduler-1` 是唯一还活着的 frappe 容器（它不依赖上面这些就能起），
+> 恰好反证了"**不是镜像坏了，是依赖没了**"。
 
 ### 时间线（推测，证据支持）
 
