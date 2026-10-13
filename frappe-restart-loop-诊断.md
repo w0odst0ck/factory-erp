@@ -113,8 +113,11 @@ cd /home/l/.openclaw/workspace/projects/factory-erp/local-ops/frappe_docker
 #   实际文件在 local-ops/frappe_docker/
 # 用 -f 显式指定可绕开
 
-docker compose -f pwd.yml start db redis-cache redis-queue
+# ⚠️ 四个依赖都要起：frontend 需要 backend（不是 redis）
+docker compose -f pwd.yml start db redis-cache redis-queue backend
 # → 依赖起来后，循环容器应能连上（它们仍在重试）
+#
+# 只起 db/redis 三个的话，frontend 仍会因 "backend:8000 host not found" 继续循环
 ```
 
 ### 方案 B｜整栈重启（推荐，一次到位）
