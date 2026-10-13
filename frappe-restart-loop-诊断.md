@@ -81,12 +81,30 @@ frappe_docker-backend-1      exited (exit 0)  started 2026-09-15   ← frontend 
 > 关键对照：`scheduler-1` 是唯一还活着的 frappe 容器（它不依赖上面这些就能起），
 > 恰好反证了"**不是镜像坏了，是依赖没了**"。
 
-### 时间线（推测，证据支持）
+### backend 的退出证据（关键补充）
 
-1. 09-11 / 09-15 / 09-16 三个依赖容器先后退出（`exit 0` = 正常停止，可能是手动 `docker compose stop` 或系统重启）
-2. 但 on-failure 策略**不会**在 exit 0 时自动重启它们 → 依赖永久缺失
-3. 而 frontend/websocket/queue-long 以 **exit 1** 失败 → 触发 on-failure → 循环至今
-4. 10-13 18:58 docker daemon 重启后，循环容器被重新拉起，继续失败（scheduler 也重启了，但依赖仍缺）
+```
+[2026-09-15 00:30:24] [1] [INFO] Starting gunicorn 23.0.0
+[2026-09-15 00:30:24] [1] [INFO] Listening at: http://0.0.0.0:8000 (1)
+[2026-09-16 15:39:11] [1] [INFO] Handling signal: term      ← 收到 SIGTERM
+[2026-09-16 15:39:13] [1] [INFO] Shutting down: Master
+```
+
+`signal: term` = **被主动停止**（`docker compose stop` / `down` / 宿主重启流程），
+**不是崩溃**（exit 0，重启策略 with `on-failure` 因此不会拉起它）。
+
+> 这说明：**09-16 整栈被停过一次**，而停的过程中依赖容器全部 `exit 0` 正常退出；
+> 只有 frontend / websocket / queue-long 因依赖消失而以 `exit 1` 失败，卡进了 on-failure 循环。
+
+### 时间线（证据支持）
+
+1. **09-16 15:39** —— 整栈被停止（backend 收到 SIGTERM；db/redis 等 exit 0）
+2. on-failure 策略**不会**在 exit 0 时自动重启它们 → 依赖永久缺失
+3. 而 frontend/websocket/queue-long 以 **exit 1** 失败 → 触发 on-failure → **循环至今**
+4. **10-13 18:58** docker daemon 重启 → 三容器被重新拉起继续失败；scheduler 也被拉起（started 10:57:51Z）但依赖仍缺
+
+> 👉 结论：这是"**停了一半又没停干净**"的状态 —— `on-failure` 策略让失败者永远重试，
+> 让正常退出者永远不回来。**方案 B（整栈 down + up）才是最贴合的解法。**
 
 ---
 
